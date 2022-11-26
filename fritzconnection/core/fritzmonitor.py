@@ -146,12 +146,9 @@ class FritzMonitor:
         if self.monitor_thread:
             # It's an error to create a second thread for monitoring
             raise RuntimeError("A FritzMonitor thread is already running")
-        # get socket or raise OSError in main thread:
-        sock = self._get_connected_socket(sock=sock)
         monitor_queue = queue.Queue(maxsize=queue_size)
         kwargs = {
             "monitor_queue": monitor_queue,
-            "sock": sock,
             "block_on_filled_queue": block_on_filled_queue,
             "reconnect_delay": reconnect_delay,
             "reconnect_tries": reconnect_tries,
@@ -172,19 +169,20 @@ class FritzMonitor:
                 self.monitor_thread.join()  # wait for termination without timeout
             self.monitor_thread = None
 
-    def _get_connected_socket(self, sock=None):
+    def _get_connected_socket(self):
         """
         Takes the given socket and builds a connection to address and port defined
         at instantiation. If no socket is given a new one gets created.
         Returns the socket.
         """
-        if sock is None:
-            sock = socket.socket()
-            # these options should work on all platforms:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            # socket actions can fail for different reasons,
-            # without a timeout they can hang a long time.
-            sock.settimeout(self.timeout)
+
+        sock = socket.socket()
+        # these options should work on all platforms:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        # socket actions can fail for different reasons,
+        # without a timeout they can hang a long time.
+        sock.settimeout(self.timeout)
+        
         try:
             sock.connect((self.address, self.port))
         except socket.timeout:
@@ -196,7 +194,6 @@ class FritzMonitor:
 
     def _reconnect_socket(
         self,
-        sock,
         max_reconnect_delay=MAX_RECONNECT_DELAY,
         reconnect_tries=RECONNECT_TRIES,
     ):
@@ -208,17 +205,16 @@ class FritzMonitor:
         while reconnect_tries > 0:
             next(reconnect_delay)
             try:
-                self._get_connected_socket(sock)
+                sock=self._get_connected_socket()
             except OSError:
                 reconnect_tries -= 1
             else:
-                return True
-        return False
+                return sock
+        return None
 
     def _monitor(
         self,
         monitor_queue,
-        sock,
         block_on_filled_queue,
         reconnect_delay,
         reconnect_tries,
@@ -230,7 +226,20 @@ class FritzMonitor:
         event_reporter = EventReporter(
             monitor_queue=monitor_queue, block_on_filled_queue=block_on_filled_queue
         )
+
+        sock=self._reconnect_socket(
+            max_reconnect_delay=reconnect_delay,
+            reconnect_tries=reconnect_tries
+            )
+        if not sock:
+            self.monitor_thread = None
+            msg = f"Unable to connect to '{self.address}:{self.port}'"
+            raise OSError(msg)
+            return 
+
         while not self.stop_flag.is_set():
+            raw_data=None
+
             try:
                 raw_data = sock.recv(FRITZ_MONITOR_CHUNK_SIZE)
             except socket.timeout:
@@ -242,12 +251,12 @@ class FritzMonitor:
             if not raw_data:
                 # empty response indicates a lost connection.
                 # try to reconnect.
-                success = self._reconnect_socket(
-                    sock,
+                sock.close()
+                sock = self._reconnect_socket(
                     max_reconnect_delay=reconnect_delay,
                     reconnect_tries=reconnect_tries,
                 )
-                if not success:
+                if not sock:
                     # reconnect has failed: terminate the thread
                     break
             else:
@@ -255,9 +264,10 @@ class FritzMonitor:
                 response = raw_data.decode(self.encoding)
                 event_reporter.add(response)
         # clean up on terminating thread:
-        try:
-            sock.close()
-        except OSError:
-            pass
+        
         # reset monitor_thread to be able to restart
         self.monitor_thread = None
+
+        msg = f"Unable to connect to '{self.address}:{self.port}'"
+        raise OSError(msg)
+
